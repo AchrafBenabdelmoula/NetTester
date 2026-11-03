@@ -1,6 +1,8 @@
 package com.nettester.app
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
@@ -62,6 +64,7 @@ class MainActivity : Activity() {
     private lateinit var btnAll: Button
     private lateinit var liveState: TextView
     private val cards = ArrayList<TestCard>()
+    private val traces = ArrayList<TracePanel>()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -129,9 +132,22 @@ class MainActivity : Activity() {
             t.row.addView(t.head); t.row.addView(t.info)
             root.addView(t.row, matchWrap(top = 5))
         }
+
+        // Tracert (3 panneaux comme la version Windows)
+        val th = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(18), 0, dp(6)) }
+        th.addView(text("Tracert", 17f, TXT, true), LinearLayout.LayoutParams(0, -2, 1f))
+        th.addView(button("TOUT LANCER", GREEN, Color.rgb(5, 46, 22)) { traces.forEach { it.start() } },
+            LinearLayout.LayoutParams(dp(120), dp(38)).apply { rightMargin = dp(6) })
+        th.addView(button("TOUT ARRETER", Color.rgb(75, 85, 99), Color.WHITE) { traces.forEach { it.stop() } },
+            LinearLayout.LayoutParams(dp(120), dp(38)))
+        root.addView(th)
+        traces.add(TracePanel("Tracert 8.8.8.8", "8.8.8.8"))
+        traces.add(TracePanel("Tracert MAGISTOR", "192.168.100.64"))
+        traces.add(TracePanel("Tracert Passerelle", gw))
+        traces.forEach { root.addView(it.view, matchWrap(top = 8)) }
     }
 
-    override fun onPause() { super.onPause(); if (liveOn) toggleLive() }
+    override fun onPause() { super.onPause(); if (liveOn) toggleLive(); traces.forEach { it.stop() } }
 
     // ---------- UI helpers ----------
     private fun matchWrap(top: Int = 0, bottom: Int = 0) =
@@ -179,6 +195,88 @@ class MainActivity : Activity() {
             thread {
                 val r = try { action() } catch (e: Exception) { TestResult(St.FAIL, "Erreur : ${e.message}") }
                 runOnUiThread { set(r.st, r.text); running = false; btn.isEnabled = true; done?.invoke() }
+            }
+        }
+    }
+
+    class Probe(val ip: String?, val reached: Boolean, val ms: Long)
+
+    // Equivalent de "tracert" : ping avec TTL croissant
+    private fun probe(host: String, ttl: Int): Probe {
+        return try {
+            val t0 = System.nanoTime()
+            val p = ProcessBuilder("/system/bin/ping", "-c", "1", "-t", ttl.toString(), "-W", "2", host).redirectErrorStream(true).start()
+            val out = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            val elapsed = (System.nanoTime() - t0) / 1_000_000
+            val tm = Regex("time=([0-9.]+)").find(out)
+            val reply = Regex("bytes from ([0-9a-fA-F.:]+)").find(out)
+            if (tm != null && reply != null) Probe(reply.groupValues[1], true, Math.round(tm.groupValues[1].toDouble()))
+            else {
+                val hop = Regex("[Ff]rom ([0-9a-fA-F.:]+)").find(out)
+                if (hop != null) Probe(hop.groupValues[1], false, elapsed) else Probe(null, false, -1)
+            }
+        } catch (e: Exception) { Probe(null, false, -1) }
+    }
+
+    inner class TracePanel(val title: String, val host: String?) {
+        val view = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(12), dp(14), dp(12)); background = box(CARD) }
+        private val state = text("\u25CF PRET", 12f, MUTED, true)
+        private val out = text("", 11f, TXT).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, dp(8)) }
+        private val btnRun: Button
+        private val sb = StringBuilder()
+        @Volatile var active = false
+
+        init {
+            val top = LinearLayout(this@MainActivity).apply { gravity = Gravity.CENTER_VERTICAL }
+            top.addView(text(title, 16f, TXT, true), LinearLayout.LayoutParams(0, -2, 1f))
+            top.addView(state)
+            view.addView(top)
+            view.addView(text(if (host != null) "Cible : $host   (max 30 sauts)" else "Cible indisponible (Wi-Fi deconnecte ?)", 11f, MUTED))
+            val row = LinearLayout(this@MainActivity).apply { setPadding(0, dp(8), 0, 0) }
+            btnRun = button("Lancer", BLUE, Color.WHITE) { if (active) stop() else start() }
+            row.addView(btnRun, LinearLayout.LayoutParams(dp(100), dp(36)).apply { rightMargin = dp(8) })
+            row.addView(button("Copier", Color.rgb(75, 85, 99), Color.WHITE) {
+                if (sb.isNotEmpty()) (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                    .setPrimaryClip(ClipData.newPlainText("tracert", sb.toString()))
+            }, LinearLayout.LayoutParams(dp(90), dp(36)))
+            view.addView(row)
+            view.addView(out)
+        }
+
+        private fun setState(st: St, label: String = st.label) { state.text = "\u25CF $label"; state.setTextColor(st.color) }
+        private fun add(line: String) { sb.append(line).append('\n'); runOnUiThread { out.text = sb.toString() } }
+
+        fun stop() { active = false }
+
+        fun start() {
+            if (host == null || active) return
+            active = true; sb.setLength(0); out.text = ""
+            btnRun.text = "Arreter"; setState(St.RUN)
+            thread {
+                add("Trace vers $host")
+                var reached = false
+                var h = 1
+                while (active && h <= 30 && !reached) {
+                    val times = ArrayList<String>(); var ip: String? = null
+                    for (i in 0 until 3) {
+                        if (!active) break
+                        val r = probe(host, h)
+                        times.add(if (r.ms < 0) "*" else "${r.ms} ms")
+                        if (r.ip != null) ip = r.ip
+                        if (r.reached) reached = true
+                    }
+                    if (!active) break
+                    add(String.format(Locale.US, "%2d  %-8s %-8s %-8s %s", h, times[0], times[1], times[2], ip ?: "Delai depasse"))
+                    h++
+                }
+                val ok = reached; val stopped = !active
+                active = false
+                add(if (ok) "Trace terminee." else if (stopped) "Arrete." else "Destination non atteinte.")
+                runOnUiThread {
+                    btnRun.text = "Lancer"
+                    if (ok) setState(St.OK, "TERMINE") else if (stopped) setState(St.IDLE, "ARRETE") else setState(St.WARN, "NON ATTEINT")
+                }
             }
         }
     }
